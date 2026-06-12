@@ -20,6 +20,8 @@ Pkg.instantiate()
 
 The calibration data (`AirView_DublinCity_Measurements_ugm3.csv`, 581 MB) is not included due to size. Obtain it from the [Google Environmental Insights Explorer](https://insights.sustainability.google/) and place it in the repository root.
 
+Daily rainfall used for the dry/wet classification of sampling days is included as `data/dublin_airport_dly532.csv` (Met Eireann daily record for Dublin Airport, station 532, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); source: [Met Eireann historical data](https://www.met.ie/climate/available-data/historical-data)). Days with a daily total of at least 0.2 mm are classed as wet.
+
 Calibrated parameters are already provided in `data/`. To re-run calibration:
 
 ```bash
