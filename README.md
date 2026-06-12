@@ -42,3 +42,17 @@ To run the GSA with distributed parallelism:
 ```bash
 julia -p 30 src/gsa_passenger_preserving_v5.jl
 ```
+
+## Optional model extensions
+
+The model ships with three optional mechanisms, added for the sensitivity analyses accompanying the paper. All are off by default, and with the defaults the model reproduces the published results exactly. Each is a keyword argument to `ecs_initialise_model`:
+
+- `cornering_coeff` (default `0.0`): lumped lateral (centripetal) tyre-wear deposit fired once at each turn entry, using the same mass and slip scaling as the per-step longitudinal tyre term. `cornering_coeff = 1.0` is the physically grounded setting. Only tyre/PM2.5 output can change; brake/UFP output is untouched. Measured effect at the calibrated parameters is negligible (any policy delta moves by at most 0.3 percentage points).
+- `mass_exp` (default `1.0`): exponent on the per-event vehicle-mass scaling `(W/1500)^mass_exp` of the brake and tyre source terms, for testing sub-linear mass scaling in the style of Beddows and Harrison (2021).
+- `wind_dx`, `wind_dy`, `wind_geometric` (defaults `0`, `0`, `false`): first-order downwind advection of every dispersed parcel, with an optional building-aware street-canyon scheme that channels flow along the street corridors and damps the cross-street component.
+
+For example, to run with cornering wear enabled:
+
+```julia
+model = ecs_initialise_model(; cornering_coeff = 1.0, ...)
+```

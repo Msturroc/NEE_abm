@@ -155,6 +155,21 @@ mutable struct SimState
     planning_distance::Float64
     dt::Float64
     regen_eff::Float64
+    cornering_coeff::Float64
+    # Uniform downwind displacement (grid cells = metres) applied to every dispersed
+    # parcel; first-order ambient-wind advection of the vehicle wake. (0,0) = OFF,
+    # identical output to the wind-free model.
+    wind_dx::Int
+    wind_dy::Int
+    # Geometric street-canyon wind: (wind_dx, wind_dy) is the AMBIENT vector; per
+    # deposit, the cross-street component is damped (skimming flow) inside each
+    # corridor, the junction box is open, and parcels advected into a wall are
+    # clamped at the kerb. false = plain uniform displacement above.
+    wind_geometric::Bool
+    # Exponent on the per-event vehicle-mass scaling (W/1500)^mass_exp in the
+    # brake and tyre source terms; 1.0 = published linear model (guarded path,
+    # identical output). Sublinear values test Beddows & Harrison style mass scaling.
+    mass_exp::Float64
 
     # Traffic light timing
     green_duration_s::Float64
@@ -539,8 +554,9 @@ end
 
 function disperse_in_cone_ecs!(grid::Matrix{Float64}, origin, dir::UInt8,
                                 amount::Float64, dims::Tuple{Int,Int},
-                                decay_table::Matrix{Float64}, radius::Int)
-    ox, oy = origin[1], origin[2]
+                                decay_table::Matrix{Float64}, radius::Int,
+                                wind_dx::Int = 0, wind_dy::Int = 0)
+    ox, oy = origin[1] + wind_dx, origin[2] + wind_dy
     width, height = dims
     @inbounds for xo in -radius:radius
         for yo in -radius:radius
@@ -564,6 +580,84 @@ function disperse_in_cone_ecs!(grid::Matrix{Float64}, origin, dir::UInt8,
     end
 end
 
+# Street-level cross-corridor wind attenuation (skimming-flow regime: canyon
+# walls suppress cross-street flow at breathing height to ~25% of ambient).
+const WIND_F_CROSS = 0.25
+
+# Geometric (street-canyon) variant of disperse_in_cone_ecs!: the ambient wind
+# (res.wind_dx, res.wind_dy) is channelled along the source's street corridor,
+# damped across it, applied in full in the open junction box, and parcels are
+# clamped at the corridor walls (kerbside trapping) instead of leaving the canyon.
+# Cone-overspill cells already beyond a wall are never pushed further out.
+function disperse_in_cone_wind!(grid::Matrix{Float64}, origin, dir::UInt8,
+                                 amount::Float64, dims::Tuple{Int,Int},
+                                 decay_table::Matrix{Float64}, radius::Int,
+                                 res::SimState)
+    ox, oy = origin[1], origin[2]
+    width, height = dims
+    # Hoist wall coordinates into typed locals: res.scaled_pos is an abstract
+    # NamedTuple field, so accessing it inside the per-cell loop would go through
+    # dynamic dispatch (~27x slowdown measured).
+    sp = res.scaled_pos
+    bot_w  = sp.bottom_wall::Int
+    top_w  = sp.top_wall::Int
+    left_w = sp.left_wall::Int
+    right_w = sp.right_wall::Int
+    in_h = bot_w <= oy <= top_w      # horizontal street corridor
+    in_v = left_w <= ox <= right_w   # vertical street corridor
+
+    wdx, wdy = if in_h && in_v          # junction box: open, full ambient vector
+        res.wind_dx, res.wind_dy
+    elseif in_h                          # along-street x passes, cross-street y damped
+        res.wind_dx, round(Int, WIND_F_CROSS * res.wind_dy)
+    else                                 # vertical corridor: mirrored
+        round(Int, WIND_F_CROSS * res.wind_dx), res.wind_dy
+    end
+
+    @inbounds for xo in -radius:radius
+        for yo in -radius:radius
+            if xo == 0 && yo == 0; continue; end
+            is_in_cone = if dir == DIR_RIGHT
+                xo <= 0 && abs(yo) <= abs(xo)
+            elseif dir == DIR_LEFT
+                xo >= 0 && abs(yo) <= abs(xo)
+            elseif dir == DIR_DOWN
+                yo >= 0 && abs(xo) <= abs(yo)
+            else  # DIR_UP
+                yo <= 0 && abs(xo) <= abs(yo)
+            end
+            if is_in_cone
+                bx = ox + xo; by = oy + yo          # wind-free landing cell
+                nx = bx + wdx; ny = by + wdy
+                # Wall clamping: bounds widened to include the wind-free cell so
+                # cone overspill beyond a wall is not pulled or pushed unphysically.
+                if in_h && in_v
+                    # Junction box: landing must stay in the corridor UNION
+                    # (corner cells are buildings). Clamp the lesser exceedance.
+                    out_x = nx < left_w || nx > right_w
+                    out_y = ny < bot_w || ny > top_w
+                    if out_x && out_y
+                        ex = nx < left_w ? left_w - nx : nx - right_w
+                        ey = ny < bot_w ? bot_w - ny : ny - top_w
+                        if ex <= ey
+                            nx = clamp(nx, min(bx, left_w), max(bx, right_w))
+                        else
+                            ny = clamp(ny, min(by, bot_w), max(by, top_w))
+                        end
+                    end
+                elseif in_h
+                    ny = clamp(ny, min(by, bot_w), max(by, top_w))
+                else
+                    nx = clamp(nx, min(bx, left_w), max(bx, right_w))
+                end
+                if 1 <= nx <= width && 1 <= ny <= height
+                    grid[nx, ny] += amount * decay_table[xo + radius + 1, yo + radius + 1]
+                end
+            end
+        end
+    end
+end
+
 function generate_brake_emissions_ecs!(res::SimState, vtype::UInt8, dir::UInt8,
                                         pos_x::Int, pos_y::Int, weight::Float32,
                                         prev_speed::Float32, cur_speed::Float32)
@@ -577,6 +671,9 @@ function generate_brake_emissions_ecs!(res::SimState, vtype::UInt8, dir::UInt8,
     decay_table = GAUSSIAN_DECAY_TABLE_ECS[r]
 
     weight_factor = Float64(weight) / 1500.0
+    if res.mass_exp != 1.0
+        weight_factor = weight_factor ^ res.mass_exp
+    end
     brake_factor = Float64(speed_reduction) / Float64(prev_speed)
     emission_factor = weight_factor * brake_factor
     if vtype == VT_E_CAR || vtype == VT_E_SUV || vtype == VT_OBSERVER
@@ -586,7 +683,11 @@ function generate_brake_emissions_ecs!(res::SimState, vtype::UInt8, dir::UInt8,
     for k in 0:vlen-1
         px = pos_x + k * dx; py = pos_y + k * dy
         wpx = mod1(px, w); wpy = mod1(py, h)
-        disperse_in_cone_ecs!(res.brake_emissions, (wpx, wpy), dir, emission_factor, res.dims, decay_table, r)
+        if res.wind_geometric
+            disperse_in_cone_wind!(res.brake_emissions, (wpx, wpy), dir, emission_factor, res.dims, decay_table, r, res)
+        else
+            disperse_in_cone_ecs!(res.brake_emissions, (wpx, wpy), dir, emission_factor, res.dims, decay_table, r, res.wind_dx, res.wind_dy)
+        end
     end
 end
 
@@ -600,6 +701,9 @@ function generate_tyre_emissions_ecs!(res::SimState, vtype::UInt8, dir::UInt8,
     decay_table = GAUSSIAN_DECAY_TABLE_ECS[r]
 
     weight_factor = Float64(weight) / 1500.0
+    if res.mass_exp != 1.0
+        weight_factor = weight_factor ^ res.mass_exp
+    end
     speed_factor = Float64(cur_speed) / 10.0
     accel_factor = abs(Float64(cur_speed) - Float64(prev_speed)) / 2.0
     emission_factor = (speed_factor + accel_factor) * weight_factor
@@ -607,7 +711,11 @@ function generate_tyre_emissions_ecs!(res::SimState, vtype::UInt8, dir::UInt8,
     for k in 0:vlen-1
         px = pos_x + k * dx; py = pos_y + k * dy
         wpx = mod1(px, w); wpy = mod1(py, h)
-        disperse_in_cone_ecs!(res.tyre_emissions, (wpx, wpy), dir, emission_factor, res.dims, decay_table, r)
+        if res.wind_geometric
+            disperse_in_cone_wind!(res.tyre_emissions, (wpx, wpy), dir, emission_factor, res.dims, decay_table, r, res)
+        else
+            disperse_in_cone_ecs!(res.tyre_emissions, (wpx, wpy), dir, emission_factor, res.dims, decay_table, r, res.wind_dx, res.wind_dy)
+        end
     end
 end
 
@@ -647,8 +755,9 @@ end
 function plan_turn_move_logic!(cur_speed::Float32, ts_state::UInt8, tp::Float32,
                                 dir::UInt8, pos_x::Int, pos_y::Int,
                                 fx::Float64, fy::Float64,
-                                vtype::UInt8, eid::UInt32, world, res::SimState)
-    if ts_state == TS_NOT_TURNING
+                                vtype::UInt8, vweight::Float32, eid::UInt32, world, res::SimState)
+    turn_entry = (ts_state == TS_NOT_TURNING)
+    if turn_entry
         ts_state = TS_TURNING
         tp = Float32(0.0)
         cur_speed = Float32(Float64(cur_speed) * 0.6)
@@ -657,6 +766,35 @@ function plan_turn_move_logic!(cur_speed::Float32, ts_state::UInt8, tp::Float32,
     new_dir = get_post_turn_direction(dir)
     vlen = get_vehicle_length(vtype)
     sp = res.scaled_pos
+
+    # === CORNERING (LATERAL/CENTRIPETAL) TYRE WEAR ===
+    # Lumped lateral tyre-slip deposit fired exactly once at turn entry (tyre/PM2.5 only;
+    # brake/UFP untouched). A 90° turn rotates the velocity vector through π/2, so the
+    # integrated lateral-slip budget is v_turn*(π/2). Applying the same /2 weighting and
+    # weight/1500 mass scaling as the per-step longitudinal tyre term (generate_tyre_emissions_ecs!)
+    # gives this deposit, with cornering_coeff a dimensionless knob (default 0.0 = OFF path,
+    # identical output). v_turn is the post-0.6-cut cur_speed, so slower turns wear less. Lands on the
+    # post-turn cone (new_dir), the cells the vehicle trails into post-jump. No RNG calls, so
+    # seeds stay deterministic; fired in the did_plan=true path where normal emission is skipped,
+    # so no double-counting with the approach braking (temporally/spatially disjoint).
+    if turn_entry && res.cornering_coeff > 0.0
+        w, h = res.dims
+        r = res.tyre_dispersion_radius
+        corner_wf = Float64(vweight) / 1500.0
+        if res.mass_exp != 1.0
+            corner_wf = corner_wf ^ res.mass_exp
+        end
+        corner_factor = res.cornering_coeff * corner_wf *
+                        (Float64(cur_speed) * (pi / 2) / 2)
+        if res.wind_geometric
+            disperse_in_cone_wind!(res.tyre_emissions, (mod1(pos_x, w), mod1(pos_y, h)),
+                                   new_dir, corner_factor, res.dims, GAUSSIAN_DECAY_TABLE_ECS[r], r, res)
+        else
+            disperse_in_cone_ecs!(res.tyre_emissions, (mod1(pos_x, w), mod1(pos_y, h)),
+                                  new_dir, corner_factor, res.dims, GAUSSIAN_DECAY_TABLE_ECS[r], r,
+                                  res.wind_dx, res.wind_dy)
+        end
+    end
 
     jump_pos = if dir == DIR_UP  # turning to LEFT
         (pos_x - vlen, sp.left_lane_left)
@@ -761,7 +899,7 @@ function _plan_vehicle!(
     if ts_state == TS_TURNING
         cur_speed, ts_state, tp, fx, fy = plan_turn_move_logic!(
             cur_speed, ts_state, tp, direction, pos_x, pos_y, fx, fy,
-            vtype, eid, world, res)
+            vtype, vweight, eid, world, res)
         cur_speed = cur_speed::Float32; fx = fx::Float64; fy = fy::Float64
         tp = tp::Float32; ts_state = ts_state::UInt8
         did_plan = true
@@ -792,7 +930,7 @@ function _plan_vehicle!(
         if should_turn
             cur_speed, ts_state, tp, fx, fy = plan_turn_move_logic!(
                 cur_speed, ts_state, tp, direction, pos_x, pos_y, fx, fy,
-                vtype, eid, world, res)
+                vtype, vweight, eid, world, res)
             cur_speed = cur_speed::Float32; fx = fx::Float64; fy = fy::Float64
             tp = tp::Float32; ts_state = ts_state::UInt8
             did_plan = true
@@ -1588,6 +1726,10 @@ function ecs_initialise_model(;
     mean_speed = 5.0, speed_variability = 1.0,
     max_sight_distance = 10, planning_distance = 5.0,
     regen_eff::Float64 = REGEN_EFF_ECS,
+    cornering_coeff::Float64 = 0.0,
+    wind_dx::Int = 0, wind_dy::Int = 0,
+    wind_geometric::Bool = false,
+    mass_exp::Float64 = 1.0,
     rng::Union{AbstractRNG,Nothing} = nothing,
     green_duration_s::Float64 = DEFAULT_GREEN_S,
     amber_duration_s::Float64 = DEFAULT_AMBER_S,
@@ -1634,7 +1776,7 @@ function ecs_initialise_model(;
         dims, decay_rate, brake_decay_rate, tyre_decay_rate,
         h_stop_right, h_stop_left, v_stop_up, v_stop_down,
         mean_speed, speed_variability, max_sight_distance, planning_distance,
-        dt, regen_eff,
+        dt, regen_eff, cornering_coeff, wind_dx, wind_dy, wind_geometric, mass_exp,
         green_duration_s, amber_duration_s, red_duration_s,
         brake_dispersion_radius, tyre_dispersion_radius,
         bus_base_weight, bus_occupancy,
@@ -1775,6 +1917,10 @@ function run_simulation(;
     data_sample_interval::Int = 1,
     random_seed::Union{Int,Nothing} = nothing,
     regen_eff::Float64 = REGEN_EFF_ECS,
+    cornering_coeff::Float64 = 0.0,
+    wind_dx::Int = 0, wind_dy::Int = 0,
+    wind_geometric::Bool = false,
+    mass_exp::Float64 = 1.0,
     green_duration_s::Float64 = DEFAULT_GREEN_S,
     amber_duration_s::Float64 = DEFAULT_AMBER_S,
     red_duration_s::Float64 = DEFAULT_RED_S,
@@ -1796,7 +1942,8 @@ function run_simulation(;
         mean_speed, speed_variability,
         brake_decay_rate, tyre_decay_rate,
         max_sight_distance, planning_distance,
-        regen_eff, green_duration_s, amber_duration_s, red_duration_s,
+        regen_eff, cornering_coeff, wind_dx, wind_dy, wind_geometric, mass_exp,
+        green_duration_s, amber_duration_s, red_duration_s,
         brake_dispersion_radius, tyre_dispersion_radius,
         bus_base_weight, bus_occupancy,
         spawn_observer = (tracked_vehicle_type === :observer)
